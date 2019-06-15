@@ -25,6 +25,7 @@
 #include <boost/range/algorithm_ext/erase.hpp>
 #include <boost/algorithm/cxx11/all_of.hpp>
 
+
 using namespace std;
 using namespace yul::test::yul_fuzzer;
 using namespace dev;
@@ -84,11 +85,53 @@ string ProtoConverter::visit(Literal const& _x)
 	}
 }
 
-// Reference any index in [0, m_numLiveVars-1]
+bool ProtoConverter::varDeclAvailable()
+{
+	if (m_inFunctionDef)
+		return m_numLiveVars > m_invisibleVarsInFunction;
+	else
+		return m_numLiveVars > 0;
+}
+
+bool ProtoConverter::functionCallNotPossible(FunctionCall_Returns _type)
+{
+	return _type == FunctionCall::SINGLE ||
+		(_type == FunctionCall::MULTIASSIGN && !varDeclAvailable());
+}
+
 void ProtoConverter::visit(VarRef const& _x)
 {
+	// If we are here, it means that we have at least one variable to reference.
 	yulAssert(m_numLiveVars > 0, "Proto fuzzer: No variables to reference.");
-	m_output  << "x_" << (static_cast<uint32_t>(_x.varnum()) % m_numLiveVars);
+
+	// However, if this variable reference happens inside a function, we need
+	// to take care to not reference a variable that is outside the scope of the
+	// function itself. m_inFunctionDef is a flag that is used to implement this
+	// requirement.
+	if (m_inFunctionDef)
+	{
+		// Number of variables that are in outer scope + function inner scope
+		// must be greater than the number of variables in outer scope.
+		yulAssert(
+			m_numLiveVars > m_invisibleVarsInFunction,
+			"Proto fuzzer: Fewer live variables than invisible variables."
+		);
+
+		// The index of the referenced variable is computed as follows:
+		// There are m_numLiveVars variables of which m_invisibleVarsInFunction are invisible
+		// Of the remaining (m_numLiveVars - m_invisibleVarsInFunction) variables, one is
+		// picked at random.
+		// Since the first variable index is zero, variable indices
+		// [0, m_invisibleVarsInFunction - 1] are not available. So the first index that
+		// may be referenced is m_invisibleVarsInFunction, and thereafter any of the
+		// [m_invisibleVarsInFunction, m_numLiveVars) variable indices.
+		m_output << "x_"
+			<< _x.varnum() % (m_numLiveVars - m_invisibleVarsInFunction) + m_invisibleVarsInFunction;
+	}
+	// If we are not inside a function definition, we can reference variable
+	// that has been declared thus far that is in scope.
+	else
+		m_output  << "x_" << _x.varnum() % m_numLiveVars;
 }
 
 void ProtoConverter::visit(Expression const& _x)
@@ -96,7 +139,13 @@ void ProtoConverter::visit(Expression const& _x)
 	switch (_x.expr_oneof_case())
 	{
 	case Expression::kVarref:
-		visit(_x.varref());
+		// If the expression requires a variable reference that we cannot provide
+		// (because there are no variables in scope), we silently output a literal
+		// expression from the optimizer dictionary.
+		if (!varDeclAvailable())
+			m_output << dictionaryToken();
+		else
+			visit(_x.varref());
 		break;
 	case Expression::kCons:
 		m_output << visit(_x.cons());
@@ -114,7 +163,12 @@ void ProtoConverter::visit(Expression const& _x)
 		visit(_x.nop());
 		break;
 	case Expression::kFuncExpr:
-		visit(_x.func_expr());
+		// FunctionCall must return a single value, otherwise
+		// we output a trivial expression "1".
+		if (_x.func_expr().ret() == FunctionCall::SINGLE)
+			visit(_x.func_expr());
+		else
+			m_output << dictionaryToken();
 		break;
 	case Expression::EXPR_ONEOF_NOT_SET:
 		m_output << dictionaryToken();
@@ -207,44 +261,6 @@ void ProtoConverter::visit(VarDecl const& _x)
 	m_numVarsPerScope.top()++;
 	m_numLiveVars++;
 	m_output << "\n";
-}
-
-void ProtoConverter::visit(EmptyVarDecl const&)
-{
-	m_output << "let x_" << m_numLiveVars++ << "\n";
-	m_numVarsPerScope.top()++;
-}
-
-void ProtoConverter::visit(MultiVarDecl const& _x)
-{
-	size_t funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecMultiReturnValue.size());
-
-	int numInParams = m_functionVecMultiReturnValue.at(funcId).first;
-	int numOutParams = m_functionVecMultiReturnValue.at(funcId).second;
-
-	// Ensure that the chosen function returns at least 2 and at most 4 values
-	yulAssert(
-		((numOutParams >= 2) && (numOutParams <= 4)),
-		"Proto fuzzer: Multi variable declaration calls a function with either too few or too many output params."
-	);
-
-	// We must start variable numbering past the number of live variables at this point in time.
-	// This creates let x_p,..., x_k :=
-	// (k-p)+1 = numOutParams
-	m_output <<
-		"let " <<
-		dev::suffixedVariableNameList("x_", m_numLiveVars, m_numLiveVars + numOutParams) <<
-		" := ";
-
-	// Create RHS of multi var decl
-	m_output << "foo_" << functionTypeToString(NumFunctionReturns::Multiple) << "_" << funcId;
-	m_output << "(";
-	visitFunctionInputParams(_x, numInParams);
-	m_output << ")\n";
-	// Update live variables in scope and in total to account for the variables created by this
-	// multi variable declaration.
-	m_numVarsPerScope.top() += numOutParams;
-	m_numLiveVars += numOutParams;
 }
 
 void ProtoConverter::visit(TypedVarDecl const& _x)
@@ -530,83 +546,112 @@ void ProtoConverter::visitFunctionInputParams(T const& _x, unsigned _numInputPar
 	}
 }
 
-void ProtoConverter::visit(MultiAssignment const& _x)
-{
-	size_t funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecMultiReturnValue.size());
-	unsigned numInParams = m_functionVecMultiReturnValue.at(funcId).first;
-	unsigned numOutParams = m_functionVecMultiReturnValue.at(funcId).second;
-	yulAssert(
-		((numOutParams >= 2) && (numOutParams <= 4)),
-		"Proto fuzzer: Multi assignment calls a function that has either too many or too few output parameters."
-	);
-
-	// Convert LHS of multi assignment
-	// We reverse the order of out param visits since the order does not matter. This helps reduce the size of this
-	// switch statement.
-	switch (numOutParams)
-	{
-	case 4:
-		visit(_x.out_param4());
-		m_output << ", ";
-		BOOST_FALLTHROUGH;
-	case 3:
-		visit(_x.out_param3());
-		m_output << ", ";
-		BOOST_FALLTHROUGH;
-	case 2:
-		visit(_x.out_param2());
-		m_output << ", ";
-		visit(_x.out_param1());
-		break;
-	default:
-		yulAssert(false, "Proto fuzzer: Function call with too many input parameters.");
-		break;
-	}
-	m_output << " := ";
-
-	// Convert RHS of multi assignment
-	m_output << "foo_" << functionTypeToString(NumFunctionReturns::Multiple) << "_" << funcId;
-	m_output << "(";
-	visitFunctionInputParams(_x, numInParams);
-	m_output << ")\n";
-}
-
-void ProtoConverter::visit(FunctionCallNoReturnVal const& _x)
-{
-	size_t funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecNoReturnValue.size());
-	unsigned numInParams = m_functionVecNoReturnValue.at(funcId);
-	m_output << "foo_" << functionTypeToString(NumFunctionReturns::None) << "_" << funcId;
-	m_output << "(";
-	visitFunctionInputParams(_x, numInParams);
-	m_output << ")\n";
-}
-
-void ProtoConverter::visit(FunctionCallSingleReturnVal const& _x)
-{
-	size_t funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecSingleReturnValue.size());
-	unsigned numInParams = m_functionVecSingleReturnValue.at(funcId);
-	m_output << "foo_" << functionTypeToString(NumFunctionReturns::Single) << "_" << funcId;
-	m_output << "(";
-	visitFunctionInputParams(_x, numInParams);
-	m_output << ")";
-}
-
 void ProtoConverter::visit(FunctionCall const& _x)
 {
-	switch (_x.functioncall_oneof_case())
+	size_t funcId;
+	unsigned numInParams, numOutParams;
+	switch (_x.ret())
 	{
-	case FunctionCall::kCallZero:
-		visit(_x.call_zero());
+	case FunctionCall::ZERO:
+		if (m_functionVecNoReturnValue.size() > 0)
+		{
+			funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecNoReturnValue.size());
+			numInParams = m_functionVecNoReturnValue.at(funcId);
+			m_output << "foo_" << functionTypeToString(NumFunctionReturns::None) << "_" << funcId;
+			m_output << "(";
+			visitFunctionInputParams(_x, numInParams);
+			m_output << ")\n";
+		}
 		break;
-	case FunctionCall::kCallMultidecl:
-		// Hack: Disallow (multi) variable declarations until scope extension is implemented for "for-init"
+	case FunctionCall::SINGLE:
+		if (m_functionVecSingleReturnValue.size() > 0)
+		{
+			funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecSingleReturnValue.size());
+			numInParams = m_functionVecSingleReturnValue.at(funcId);
+			m_output << "foo_" << functionTypeToString(NumFunctionReturns::Single) << "_" << funcId;
+			m_output << "(";
+			visitFunctionInputParams(_x, numInParams);
+			m_output << ")";
+		}
+		else
+			m_output << dictionaryToken();
+		break;
+	case FunctionCall::MULTIDECL:
+		// Hack: Disallow (multi) variable declarations until scope extension
+		// is implemented for "for-init"
 		if (!m_inForInitScope)
-			visit(_x.call_multidecl());
+		{
+			if (m_functionVecMultiReturnValue.size() > 0) {
+				funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecMultiReturnValue.size());
+
+				numInParams = m_functionVecMultiReturnValue.at(funcId).first;
+				numOutParams = m_functionVecMultiReturnValue.at(funcId).second;
+
+				// Ensure that the chosen function returns at least 2 and at most 4 values
+				yulAssert(
+					((numOutParams >= 2) && (numOutParams <= 4)),
+					"Proto fuzzer: Multi variable declaration calls a function with either too few or too many output params."
+				);
+
+				// We must start variable numbering past the number of live variables at this point in time.
+				// This creates let x_p,..., x_k :=
+				// (k-p)+1 = numOutParams
+				m_output <<
+				         "let " <<
+				         suffixedVariableNameList("x_", m_numLiveVars, m_numLiveVars + numOutParams) <<
+				         " := ";
+
+				// Create RHS of multi var decl
+				m_output << "foo_" << functionTypeToString(NumFunctionReturns::Multiple) << "_" << funcId;
+				m_output << "(";
+				visitFunctionInputParams(_x, numInParams);
+				m_output << ")\n";
+				// Update live variables in scope and in total to account for the variables created by this
+				// multi variable declaration.
+				m_numVarsPerScope.top() += numOutParams;
+				m_numLiveVars += numOutParams;
+			}
+		}
 		break;
-	case FunctionCall::kCallMultiassign:
-		visit(_x.call_multiassign());
-		break;
-	case FunctionCall::FUNCTIONCALL_ONEOF_NOT_SET:
+	case FunctionCall::MULTIASSIGN:
+		if (m_functionVecMultiReturnValue.size() > 0) {
+			funcId = (static_cast<size_t>(_x.func_index()) % m_functionVecMultiReturnValue.size());
+			numInParams = m_functionVecMultiReturnValue.at(funcId).first;
+			numOutParams = m_functionVecMultiReturnValue.at(funcId).second;
+			yulAssert(
+				((numOutParams >= 2) && (numOutParams <= 4)),
+				"Proto fuzzer: Multi assignment calls a function that has either too many or too few output parameters."
+			);
+
+			// Convert LHS of multi assignment
+			// We reverse the order of out param visits since the order does not matter. This helps reduce the size of this
+			// switch statement.
+			switch (numOutParams) {
+				case 4:
+					visit(_x.out_param4());
+					m_output << ", ";
+					BOOST_FALLTHROUGH;
+				case 3:
+					visit(_x.out_param3());
+					m_output << ", ";
+					BOOST_FALLTHROUGH;
+				case 2:
+					visit(_x.out_param2());
+					m_output << ", ";
+					visit(_x.out_param1());
+					break;
+				default:
+					yulAssert(false, "Proto fuzzer: Function call with too many or too few input parameters.");
+					break;
+			}
+			m_output << " := ";
+
+			// Convert RHS of multi assignment
+			m_output << "foo_" << functionTypeToString(NumFunctionReturns::Multiple) << "_" << funcId;
+			m_output << "(";
+			visitFunctionInputParams(_x, numInParams);
+			m_output << ")\n";
+		}
 		break;
 	}
 }
@@ -742,7 +787,7 @@ void ProtoConverter::visit(SwitchStmt const& _x)
 {
 	if (_x.case_stmt_size() > 0 || _x.has_default_block())
 	{
-		std::set<dev::u256> s;
+		std::set<u256> s;
 		m_switchLiteralSetPerScope.push(s);
 		m_output << "switch ";
 		visit(_x.switch_expr());
@@ -828,7 +873,10 @@ void ProtoConverter::visit(Statement const& _x)
 			visit(_x.decl());
 		break;
 	case Statement::kAssignment:
-		visit(_x.assignment());
+		// Create an assignment statement only if there is at least one variable
+		// declaration that is in scope.
+		if (varDeclAvailable())
+			visit(_x.assignment());
 		break;
 	case Statement::kIfstmt:
 		visit(_x.ifstmt());
@@ -869,7 +917,14 @@ void ProtoConverter::visit(Statement const& _x)
 		visit(_x.terminatestmt());
 		break;
 	case Statement::kFunctioncall:
+		// Return early if a function call cannot be created
+		if (functionCallNotPossible(_x.functioncall().ret()))
+			return;
 		visit(_x.functioncall());
+		break;
+	case Statement::kFuncdef:
+		if (!m_inForInitScope)
+			visit(_x.funcdef());
 		break;
 	case Statement::STMT_ONEOF_NOT_SET:
 		break;
@@ -892,37 +947,99 @@ void ProtoConverter::visit(Block const& _x)
 		m_output << "{}\n";
 }
 
-void ProtoConverter::visit(SpecialBlock const& _x)
+template <class T>
+void ProtoConverter::registerFunction(
+	T const& _x,
+	NumFunctionReturns _type,
+	unsigned _numOutputParams
+)
 {
-	m_numVarsPerScope.push(0);
-	m_output << "{\n";
-	visit(_x.var());
-	if (_x.statements_size() > 0)
-		for (auto const& st: _x.statements())
-			visit(st);
-	m_numLiveVars -= m_numVarsPerScope.top();
-	m_numVarsPerScope.pop();
-	m_output << "}\n";
+	unsigned numInputParams = _x.num_input_params() % modInputParams;
+	switch (_type)
+	{
+		case NumFunctionReturns::None:
+			m_functionVecNoReturnValue.push_back(numInputParams);
+			break;
+		case NumFunctionReturns::Single:
+			m_functionVecSingleReturnValue.push_back(numInputParams);
+			break;
+		case NumFunctionReturns::Multiple:
+			m_functionVecMultiReturnValue.push_back(std::make_pair(numInputParams, _numOutputParams));
+			break;
+	}
+}
+
+void ProtoConverter::scopedFunctionCall(
+	unsigned _numInputs,
+	unsigned _numOutputs,
+	std::string _funcIndex,
+	NumFunctionReturns _type
+)
+{
+	if (_numOutputs > 0)
+		// let x_i, ..., x_n = foo()
+		m_output << "let "
+			<< suffixedVariableNameList("x_", m_numLiveVars, m_numLiveVars + _numOutputs)
+			<< " := ";
+
+	// Call the function with the correct number of input parameters via calls to calldataload with
+	// incremental addresses.
+	m_output << "foo_"
+		<< functionTypeToString(_type)
+		<< "_"
+		<< _funcIndex;
+	m_output << "(";
+	for (unsigned i = 0; i < _numInputs; i++)
+	{
+		m_output << "calldataload(" << std::to_string(i*32) << ")";
+		if (i < _numInputs - 1)
+			m_output << ",";
+	}
+	m_output << ")\n";
+
+	for (unsigned i = 0; i < _numOutputs; i++)
+		m_output << "sstore(" << std::to_string(i*32) << ", x_" << m_numLiveVars + i << ")\n";
+
+	// Book keeping
+	m_numVarsPerScope.top() += _numOutputs;
+	m_numLiveVars += _numOutputs;
 }
 
 template <class T>
-void ProtoConverter::createFunctionDefAndCall(T const& _x, unsigned _numInParams, unsigned _numOutParams, NumFunctionReturns _type)
+void ProtoConverter::createFunctionDefAndCall(
+	T const& _x,
+	unsigned _numInParams,
+	unsigned _numOutParams,
+	NumFunctionReturns _type
+)
 {
 	yulAssert(
 		((_numInParams <= modInputParams - 1) && (_numOutParams <= modOutputParams - 1)),
 		"Proto fuzzer: Too many function I/O parameters requested."
 	);
 
-	// At the time of function definition creation, the number of live variables must be 0.
-	// This is because we always create only as many variables as we need within function scope.
-	yulAssert(m_numLiveVars == 0, "Proto fuzzer: Unused live variable found.");
+	// Register function
+	registerFunction(_x, _type, _numOutParams);
+
+	// Variable index at the time this function definition takes place.
+	unsigned numOuterVars = m_numLiveVars;
 
 	// Signature
-	// This creates function foo_<noreturn|singlereturn|multireturn>_<m_numFunctionSets>(x_0,...,x_n)
-	m_output << "function foo_" << functionTypeToString(_type) << "_" << m_numFunctionSets;
+	// This creates function foo_<noreturn|singlereturn|multireturn>_<index>(x_0,...,x_n)
+	std::string funcIndex = functionTypeToIndex(_type);
+	m_output <<
+		"function foo_" <<
+		functionTypeToString(_type) <<
+		"_" <<
+		funcIndex;
 	m_output << "(";
 	if (_numInParams > 0)
-		m_output << dev::suffixedVariableNameList("x_", 0, _numInParams);
+		m_output <<
+			suffixedVariableNameList(
+				"x_",
+				numOuterVars,
+				numOuterVars + _numInParams
+			);
 	m_output << ")";
 
 	// Book keeping for variables in function scope and in nested scopes
@@ -932,70 +1049,62 @@ void ProtoConverter::createFunctionDefAndCall(T const& _x, unsigned _numInParams
 	// This creates -> x_n+1,...,x_r
 	if (_numOutParams > 0)
 	{
-		m_output << " -> " << dev::suffixedVariableNameList("x_", _numInParams, _numInParams + _numOutParams);
+		m_output <<
+			" -> " <<
+			suffixedVariableNameList(
+				"x_",
+				_numInParams + numOuterVars,
+				_numInParams + numOuterVars + _numOutParams
+			);
 		// More bookkeeping
 		m_numVarsPerScope.top() += _numOutParams;
 		m_numLiveVars += _numOutParams;
 	}
 	m_output << "\n";
 
+	// If function definition is in for-loop body, update
+	bool wasInForBody = m_inForBodyScope;
+	m_inForBodyScope = false;
+
 	// Body
-	visit(_x.statements());
+	visit(_x.block());
 
 	// Ensure that variable stack is balanced
 	m_numLiveVars -= m_numVarsPerScope.top();
 	m_numVarsPerScope.pop();
-	yulAssert(m_numLiveVars == 0, "Proto fuzzer: Variable stack after function definition is unbalanced.");
+	yulAssert(
+		m_numLiveVars == numOuterVars,
+		"Proto fuzzer: Variable stack after function definition is unbalanced."
+	);
 
-	// Manually create a multi assignment using global variables
-	// This prints a_0, ..., a_k-1 for this function that returns "k" values
-	if (_numOutParams > 0)
-		m_output << dev::suffixedVariableNameList("a_", 0, _numOutParams) << " := ";
+	// Call function that has just been defined.
+	scopedFunctionCall(_numInParams, _numOutParams, funcIndex, _type);
 
-	// Call the function with the correct number of input parameters via calls to calldataload with
-	// incremental addresses.
-	m_output << "foo_" << functionTypeToString(_type) << "_" << std::to_string(m_numFunctionSets);
-	m_output << "(";
-	for (unsigned i = 0; i < _numInParams; i++)
-	{
-		m_output << "calldataload(" << std::to_string(i*32) << ")";
-		if (i < _numInParams - 1)
-			m_output << ",";
-	}
-	m_output << ")\n";
-
-	for (unsigned i = 0; i < _numOutParams; i++)
-		m_output << "sstore(" << std::to_string(i*32) << ", a_" << std::to_string(i) << ")\n";
+	// Restore for loop state
+	m_inForBodyScope = wasInForBody;
 }
 
-void ProtoConverter::visit(FunctionDefinitionNoReturnVal const& _x)
+void ProtoConverter::visit(FunctionDef const& _x)
 {
+	// Save state and set locally
+	bool inFunctionDef = m_inFunctionDef;
+	m_inFunctionDef = true;
+	// Function cannot reference variables in the range [0, m_numLiveVars)
+	unsigned wasInvisible = m_invisibleVarsInFunction;
+	m_invisibleVarsInFunction = m_numLiveVars;
 	unsigned numInParams = _x.num_input_params() % modInputParams;
-	unsigned numOutParams = 0;
-	createFunctionDefAndCall(_x, numInParams, numOutParams, NumFunctionReturns::None);
-}
-
-void ProtoConverter::visit(FunctionDefinitionSingleReturnVal const& _x)
-{
-	unsigned numInParams = _x.num_input_params() % modInputParams;
-	unsigned numOutParams = 1;
-	createFunctionDefAndCall(_x, numInParams, numOutParams, NumFunctionReturns::Single);
-}
-
-void ProtoConverter::visit(FunctionDefinitionMultiReturnVal const& _x)
-{
-	unsigned numInParams = _x.num_input_params() % modInputParams;
-	// Synthesize at least 2 return parameters and at most (modOutputParams - 1)
-	unsigned numOutParams = std::max<unsigned>(2, _x.num_output_params() % modOutputParams);
-	createFunctionDefAndCall(_x, numInParams, numOutParams, NumFunctionReturns::Multiple);
-}
-
-void ProtoConverter::visit(FunctionDefinition const& _x)
-{
-	visit(_x.fd_zero());
-	visit(_x.fd_one());
-	visit(_x.fd_multi());
-	m_numFunctionSets++;
+	unsigned numOutParams = _x.num_output_params() % modOutputParams;
+	NumFunctionReturns numReturns;
+	if (numOutParams == 0)
+		numReturns = NumFunctionReturns::None;
+	else if (numOutParams == 1)
+		numReturns = NumFunctionReturns::Single;
+	else
+		numReturns = NumFunctionReturns::Multiple;
+	createFunctionDefAndCall(_x, numInParams, numOutParams, numReturns);
+	// Restore state
+	m_inFunctionDef = inFunctionDef;
+	m_invisibleVarsInFunction = wasInvisible;
 }
 
 void ProtoConverter::visit(Program const& _x)
@@ -1004,25 +1113,14 @@ void ProtoConverter::visit(Program const& _x)
 	m_inputSize = _x.ByteSizeLong();
 
 	/* Program template is as follows
-	 *      Four Globals a_0, a_1, a_2, and a_3 to hold up to four function return values
-	 *
-	 *      Repeated function definitions followed by function calls of the respective function
+	 *      Zero or more statements. If function definition is present, it is
+	 *      called post definition.
 	 *          Example: function foo(x_0) -> x_1 {}
-	 *                   a_0 := foo(calldataload(0))
-	 *                   sstore(0, a_0)
+	 *                   x_2 := foo(calldataload(0))
+	 *                   sstore(0, x_2)
 	 */
 	m_output << "{\n";
-	// Create globals at the beginning
-	// This creates let a_0, a_1, a_2, a_3 (followed by a new line)
-	m_output << "let " << dev::suffixedVariableNameList("a_", 0, modOutputParams - 1) << "\n";
-	// Register function interface. Useful while visiting multi var decl/assignment statements.
-	for (auto const& f: _x.funcs())
-		registerFunction(f);
-
-	for (auto const& f: _x.funcs())
-		visit(f);
-
-	yulAssert((unsigned)_x.funcs_size() == m_numFunctionSets, "Proto fuzzer: Functions not correctly registered.");
+	visit(_x.block());
 	m_output << "}\n";
 }
 
@@ -1030,16 +1128,6 @@ string ProtoConverter::programToString(Program const& _input)
 {
 	visit(_input);
 	return m_output.str();
-}
-
-void ProtoConverter::registerFunction(FunctionDefinition const& _x)
-{
-	// No return and single return functions explicitly state the number of values returned
-	registerFunction(_x.fd_zero(), NumFunctionReturns::None);
-	registerFunction(_x.fd_one(), NumFunctionReturns::Single);
-	// A multi return function can have between two and (modOutputParams - 1) parameters
-	unsigned numOutParams = std::max<unsigned>(2, _x.fd_multi().num_output_params() % modOutputParams);
-	registerFunction(_x.fd_multi(), NumFunctionReturns::Multiple, numOutParams);
 }
 
 std::string ProtoConverter::functionTypeToString(NumFunctionReturns _type)
@@ -1052,5 +1140,18 @@ std::string ProtoConverter::functionTypeToString(NumFunctionReturns _type)
 		return "singlereturn";
 	case NumFunctionReturns::Multiple:
 		return "multireturn";
+	}
+}
+
+std::string ProtoConverter::functionTypeToIndex(NumFunctionReturns _type)
+{
+	switch (_type)
+	{
+		case NumFunctionReturns::None:
+			return std::to_string(m_numFunctionsNoRet++);
+		case NumFunctionReturns::Single:
+			return std::to_string(m_numFunctionsSingleRet++);
+		case NumFunctionReturns::Multiple:
+			return std::to_string(m_numFunctionsMultiRet++);
 	}
 }

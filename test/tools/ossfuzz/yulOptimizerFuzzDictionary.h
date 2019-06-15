@@ -1,4 +1,3 @@
-
 static const std::vector<std::string> hexDictionary = {
 	"0",
 	"1",
