@@ -385,12 +385,12 @@ Declaration::Visibility Parser::parseVisibilitySpecifier()
 ASTPointer<OverrideSpecifier> Parser::parseOverrideSpecifier()
 {
 	solAssert(m_scanner->currentToken() == Token::Override, "");
+
 	ASTNodeFactory nodeFactory(*this);
+	std::vector<ASTPointer<UserDefinedTypeName>> overrides;
 
 	nodeFactory.markEndPosition();
 	m_scanner->next();
-
-	std::vector<ASTPointer<UserDefinedTypeName>> overrides;
 
 	if (m_scanner->currentToken() == Token::LParen)
 	{
